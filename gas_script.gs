@@ -685,6 +685,7 @@ function onOpen() {
     .addItem('納品確認書プルダウンのみ再設定', 'setupInvoiceDropdown')
     .addItem('会期プルダウンを更新（ロイヤリティレポート!C13・納品確認書!C13）', 'setupRoyaltyPeriodDropdown')
     .addItem('フォーム受取チェックを再実行（手動）', 'recheckFormReceipts')
+    .addItem('在庫変動ログの商品名プルダウンを一斉更新', 'refreshAllLogProductDropdowns')
     .addToUi();
   // ※「🔍 作家名で検索してNo.を入力」は第6回からマスタファイル側の専用メニューに移管した
 }
@@ -767,6 +768,48 @@ function extractTokens(str) {
 // 在庫変動ログ：作家名（B列）を編集したら、同じ行の作品名（C列）に
 // その作家の商品一覧_確定上の作品名リストをデータの入力規則として設定する
 // ============================================================
+// ============================================================
+// 在庫変動ログの1行分（B列：作家名）に対して、C列（作品名）の
+// プルダウンを設定する共通処理。onEdit経由の自動更新・メニューからの
+// 一斉更新の両方から呼ばれる。
+// ============================================================
+function applyLogProductDropdown(sheet, row, finalData) {
+  const artistName = String(sheet.getRange(row, 2).getValue() || '').trim();
+  const productCell = sheet.getRange(row, 3); // C列：作品名
+
+  if (!artistName || !finalData) {
+    productCell.clearDataValidations();
+    return;
+  }
+
+  const normalizedTarget = normalizeToken(artistName);
+  const productNames = [];
+  for (let i = 1; i < finalData.length; i++) {
+    const rowArtist = String(finalData[i][0] || '');
+    if (normalizeToken(rowArtist) === normalizedTarget) {
+      const productName = finalData[i][1];
+      if (productName && productNames.indexOf(productName) === -1) {
+        productNames.push(productName);
+      }
+    }
+  }
+
+  if (productNames.length === 0) {
+    // 商品一覧_確定に該当作家がいない場合（前会期の余り在庫など）は手入力を許可
+    productCell.clearDataValidations();
+    return;
+  }
+
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(productNames, true)
+    .setAllowInvalid(true) // 手入力も許可（未登録作品メモ運用のため）
+    .build();
+  productCell.setDataValidation(rule);
+}
+
+// ============================================================
+// onEdit経由：編集された範囲（B列を含む場合）だけプルダウンを更新する
+// ============================================================
 function updateLogProductDropdown(e) {
   const sheet = e.range.getSheet();
   const startRow = e.range.getRow();
@@ -784,42 +827,47 @@ function updateLogProductDropdown(e) {
   for (let r = 0; r < numRows; r++) {
     const row = startRow + r;
     if (row <= 1) continue; // ヘッダー行は対象外
-
-    // e.valueには頼らず、実際のセル値を読み直す
-    // （e.valueは単一セル編集時しかセットされず、複数セルへのコピペでは
-    //   undefinedになってしまうため、貼り付けだと反応しない原因になっていた）
-    const artistName = String(sheet.getRange(row, 2).getValue() || '').trim();
-    const productCell = sheet.getRange(row, 3); // C列：作品名
-
-    if (!artistName || !finalData) {
-      productCell.clearDataValidations();
-      continue;
-    }
-
-    const normalizedTarget = normalizeToken(artistName);
-    const productNames = [];
-    for (let i = 1; i < finalData.length; i++) {
-      const rowArtist = String(finalData[i][0] || '');
-      if (normalizeToken(rowArtist) === normalizedTarget) {
-        const productName = finalData[i][1];
-        if (productName && productNames.indexOf(productName) === -1) {
-          productNames.push(productName);
-        }
-      }
-    }
-
-    if (productNames.length === 0) {
-      // 商品一覧_確定に該当作家がいない場合（前会期の余り在庫など）は手入力を許可
-      productCell.clearDataValidations();
-      continue;
-    }
-
-    const rule = SpreadsheetApp.newDataValidation()
-      .requireValueInList(productNames, true)
-      .setAllowInvalid(true) // 手入力も許可（未登録作品メモ運用のため）
-      .build();
-    productCell.setDataValidation(rule);
+    applyLogProductDropdown(sheet, row, finalData);
   }
+}
+
+// ============================================================
+// メニュー実行用：在庫変動ログの全行を対象に、C列（作品名）の
+// プルダウンを一斉更新する。
+// 【使いどころ】B列（作家名）が先に入力されていた行は、その時点では
+// まだ商品一覧_確定が存在しない・作家名が一致しない等の理由でプルダウンが
+// 未設定のまま残ることがある。そのままだと後から商品一覧_確定が更新されても、
+// 既存の行のプルダウンは自動では追従しない（onEditは新たに編集された
+// セルにしか反応しないため）。この関数を実行すると、シート全体を
+// 再スキャンしてB列の内容をもとにC列のプルダウンをすべて設定し直す。
+// ============================================================
+function refreshAllLogProductDropdowns() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(LOG_SHEET_NAME);
+  const finalSheet = ss.getSheetByName(PRODUCT_SHEET_FINAL);
+
+  if (!sheet) {
+    ui.alert('シート「' + LOG_SHEET_NAME + '」が見つかりません。');
+    return;
+  }
+  if (!finalSheet) {
+    ui.alert('シート「' + PRODUCT_SHEET_FINAL + '」が見つかりません。\n先に「② 納品確定を更新」を実行してください。');
+    return;
+  }
+
+  const finalData = finalSheet.getDataRange().getValues();
+  const lastRow = sheet.getLastRow();
+  let updatedCount = 0;
+
+  for (let row = 2; row <= lastRow; row++) {
+    const artistName = String(sheet.getRange(row, 2).getValue() || '').trim();
+    if (!artistName) continue;
+    applyLogProductDropdown(sheet, row, finalData);
+    updatedCount++;
+  }
+
+  ui.alert('完了！\n在庫変動ログの' + updatedCount + '行分、作品名のプルダウンを更新しました。');
 }
 
 
@@ -1087,9 +1135,9 @@ function updateInventorySheet() {
         case '返却':       entry.returned += qty; break;
         case '買取済在庫':  entry.acquired += qty; break; // 現在庫には含めるが、売上集計には含めない（ロイヤリティレポート側で対応）
         case '紛失':       entry.lost += qty; break; // 紛失分は在庫数から減算する
-        case '繰越入庫':    entry.carriedIn += qty; break; // 他会期から入ってきた分。在庫数（ログ集計）には加算するが、納品済み(サンプル込)には含めない
-        case '振替出庫':  entry.transferredOut += qty; break; // 他会期へ出ていった分。在庫数（ログ集計）から減算するが、納品済み(サンプル込)には含めない
-        case 'サンプル返却': entry.sampleReturned += qty; break; // 作家へサンプルを返却した分。在庫数（ログ集計）から減算する
+        case '繰越入庫':    entry.carriedIn += qty; break; // 他会期から入ってきた分。在庫数（販売可サンプル含）には加算するが、納品済み(サンプル込)には含めない
+        case '振替出庫':  entry.transferredOut += qty; break; // 他会期へ出ていった分。在庫数（販売可サンプル含）から減算するが、納品済み(サンプル込)には含めない
+        case 'サンプル返却': entry.sampleReturned += qty; break; // 作家へサンプルを返却した分。在庫数（販売可サンプル含）から減算する
       }
 
       // この行が基本行（商品一覧_確定）にない場合は新規追加対象にする
@@ -1109,7 +1157,7 @@ function updateInventorySheet() {
 
   // ---- 出力用の行を組み立て ----
   const headers = ['作家名', '作品名', '商品コード', '税込価格', 'サンプル数', '納品予定数',
-                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', 'サンプル返却', '在庫数（ログ集計）', '推定販売数', '残在庫(実数)'];
+                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', '返却済サンプル', '在庫数（販売可サンプル含）', '推定販売数', '残在庫(実数)'];
   const rows = [];
 
   baseOrder.forEach(function(key) {
@@ -1135,8 +1183,8 @@ function updateInventorySheet() {
     // サンプル販売不可分は在庫数から除外する
     const sampleExcluded = (base.sampleOk === '不可能') ? log.sample : 0;
 
-    // 在庫数（ログ集計）＝納品済み＋買取済在庫＋繰越入庫－振替出庫－破損－返却－取り置き中－紛失
-    //   －サンプル返却－サンプル販売不可分
+    // 在庫数（販売可サンプル含）＝納品済み＋買取済在庫＋繰越入庫－振替出庫－破損－返却－取り置き中－紛失
+    //   －返却済サンプル－サンプル販売不可分
     // （販売は引かない＝会期末の実数カウントと比較するための理論値。繰越入庫・振替出庫・買取済在庫は
     //   「今回作家から新しく届いた点数」ではないため、納品済み(サンプル込)には含めない）
     const theoreticalStock = delivered + log.acquired + log.carriedIn - log.transferredOut
@@ -1160,7 +1208,7 @@ function updateInventorySheet() {
       log.returned === 0 ? '' : log.returned,
       log.sampleReturned === 0 ? '' : log.sampleReturned,
       theoreticalStock === 0 ? '' : theoreticalStock,
-      '', // 推定販売数：後段で「在庫数（ログ集計）－残在庫(実数)」の数式を差し込む（同じ行の隣接セル参照）
+      '', // 推定販売数：後段で「在庫数（販売可サンプル含）－残在庫(実数)」の数式を差し込む（同じ行の隣接セル参照）
       hasManualStock ? manualStock : '',
     ]);
   });
@@ -1172,8 +1220,8 @@ function updateInventorySheet() {
     return String(a[0]).localeCompare(String(b[0]), 'ja');
   });
 
-  // 推定販売数（列N＝13番目、0始まりで13）に「在庫数（ログ集計）－残在庫(実数)」の数式を差し込む。
-  // 列M＝在庫数（ログ集計）、列O＝残在庫(実数)は同じ行の隣接セルなので、行番号さえ分かれば
+  // 推定販売数（列N＝13番目、0始まりで13）に「在庫数（販売可サンプル含）－残在庫(実数)」の数式を差し込む。
+  // 列M＝在庫数（販売可サンプル含）、列O＝残在庫(実数)は同じ行の隣接セルなので、行番号さえ分かれば
   // シンプルな同一シート内参照で済む（ソート後の最終的な行位置を使って組み立てる）。
   // 残在庫(実数)が空欄（会期末カウント未実施）の間は空欄のまま、という以前の挙動を
   // IF文で再現している。値ではなく数式にしたことで、残在庫(実数)が更新されると
@@ -1187,7 +1235,7 @@ function updateInventorySheet() {
   const sheet = buildProductSheet(INVENTORY_SHEET, rows, headers);
   addArtistBorders(sheet, rows, headers);
 
-  // 「破損」「返却」「サンプル返却」列は普段見る必要が薄いため、デフォルトで折りたたんでおく
+  // 「破損」「返却」「返却済サンプル」列は普段見る必要が薄いため、デフォルトで折りたたんでおく
   // （列番号10〜12＝J・K・L列）。見たいときは列見出しの「+」をクリックすれば展開できる
   sheet.hideColumns(10, 3);
 
@@ -1261,7 +1309,7 @@ function updateInventorySheetBySku() {
   const squareMap = getSquareSalesMap();
 
   const headers = ['作家名', '作品名', '商品コード', '税込価格', 'サンプル数', '納品予定数',
-                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', 'サンプル返却', '在庫数（ログ集計）', '残在庫(実数)', '推定販売数', 'Square販売数'];
+                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', '返却済サンプル', '在庫数（販売可サンプル含）', '残在庫(実数)', '推定販売数', 'Square販売数'];
 
   function toNum(v) {
     const n = Number(v);
@@ -1272,8 +1320,8 @@ function updateInventorySheetBySku() {
   }
 
   // 在庫管理(商品ごと)の列：0作家名 1作品名 2商品コード 3税込価格 4サンプル数 5納品予定数
-  // 6納品済み(サンプル込) 7取置き中 8紛失 9破損 10返却 11サンプル返却
-  // 12在庫数（ログ集計） 13推定販売数 14残在庫(実数)
+  // 6納品済み(サンプル込) 7取置き中 8紛失 9破損 10返却 11返却済サンプル
+  // 12在庫数（販売可サンプル含） 13推定販売数 14残在庫(実数)
   const groupMap = new Map(); // 商品コード -> 集計用オブジェクト
   const groupOrder = [];
   const passthroughRows = []; // 商品コードが空の行はそのまま出力（末尾に追加）
@@ -1367,7 +1415,7 @@ function updateInventorySheetBySku() {
   const sheet = buildProductSheet(INVENTORY_SHEET_BY_SKU, rows, headers);
   addArtistBorders(sheet, rows, headers);
 
-  // 「破損」「返却」「サンプル返却」列は普段見る必要が薄いため、デフォルトで折りたたんでおく
+  // 「破損」「返却」「返却済サンプル」列は普段見る必要が薄いため、デフォルトで折りたたんでおく
   // （列番号10〜12＝J・K・L列）
   sheet.hideColumns(10, 3);
 
