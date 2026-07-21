@@ -217,6 +217,13 @@ function updatePlanList() {
     return;
   }
 
+  // 作家名（0列目）で昇順ソート。フォーム回答順のままだと同じ作家の行が
+  // 途中で分断され、addArtistBordersの太線が正しく引けなくなるため。
+  // Array.sortは安定ソートなので、同じ作家内の作品の並び順（フォーム回答順）は保たれる。
+  rows.sort(function(a, b) {
+    return String(a[0]).localeCompare(String(b[0]), 'ja');
+  });
+
   const planSheet = buildProductSheet(PRODUCT_SHEET_PLAN, rows, headers);
   addArtistBorders(planSheet, rows, headers);
   protectSheet(planSheet, '商品一覧_予定はスクリプトが自動管理します。手動編集不可。');
@@ -277,6 +284,12 @@ function buildFinalProductList() {
     SpreadsheetApp.getUi().alert('展開できる商品データがありませんでした。');
     return null;
   }
+
+  // 作家名（0列目）で昇順ソート。フォーム回答順のままだと同じ作家の行が
+  // 途中で分断され、addArtistBordersの太線が正しく引けなくなるため。
+  rows.sort(function(a, b) {
+    return String(a[0]).localeCompare(String(b[0]), 'ja');
+  });
 
   const finalSheet = buildProductSheet(PRODUCT_SHEET_FINAL, rows, headers);
   addArtistBorders(finalSheet, rows, headers);
@@ -1152,6 +1165,13 @@ function updateInventorySheet() {
     ]);
   });
 
+  // 作家名（0列目）で昇順ソート。買取済在庫・繰越入庫のみで商品一覧_確定に
+  // 存在しない商品は末尾に追加されるため、明示的にソートしないと同じ作家の行が
+  // 分断され、太線が正しく引けなくなることがある。
+  rows.sort(function(a, b) {
+    return String(a[0]).localeCompare(String(b[0]), 'ja');
+  });
+
   // ---- シートに書き込み ----
   const sheet = buildProductSheet(INVENTORY_SHEET, rows, headers);
   addArtistBorders(sheet, rows, headers);
@@ -1288,15 +1308,16 @@ function updateInventorySheetBySku() {
     if (squareNet !== '')  { g.squareSold += toNum(squareNet); g.hasSquareSold = true; }
   }
 
-  const rows = [];
-  const mismatchRowIndexes = []; // rows配列上のインデックス（0始まり）
+  // rowEntries：各行データと「不一致フラグ」をセットで持つ。ソート後もフラグが
+  // 正しい行についてくるよう、rowsとmismatchRowIndexesを別々に作らずここでまとめる。
+  const rowEntries = [];
 
   groupOrder.forEach(function(code) {
     const g = groupMap.get(code);
     const estimatedSoldVal = g.hasEstimatedSold ? g.estimatedSold : '';
     const squareSoldVal = g.hasSquareSold ? g.squareSold : '';
 
-    rows.push([
+    const row = [
       g.artist, g.product, code, g.taxPrice,
       g.sample, g.deliveryPlanned, g.delivered, g.reserved === 0 ? '' : g.reserved,
       g.lost === 0 ? '' : g.lost,
@@ -1306,19 +1327,27 @@ function updateInventorySheetBySku() {
       g.hasCurrentStock ? g.currentStock : '',
       estimatedSoldVal,
       squareSoldVal,
-    ]);
-
-    if (g.hasEstimatedSold && g.hasSquareSold && g.estimatedSold !== g.squareSold) {
-      mismatchRowIndexes.push(rows.length - 1);
-    }
+    ];
+    const mismatch = g.hasEstimatedSold && g.hasSquareSold && g.estimatedSold !== g.squareSold;
+    rowEntries.push({ row: row, mismatch: mismatch });
   });
 
   passthroughRows.forEach(function(r) {
-    rows.push(r);
     const est = r[13], sq = r[14];
-    if (est !== '' && sq !== '' && Number(est) !== Number(sq)) {
-      mismatchRowIndexes.push(rows.length - 1);
-    }
+    const mismatch = est !== '' && sq !== '' && Number(est) !== Number(sq);
+    rowEntries.push({ row: r, mismatch: mismatch });
+  });
+
+  // 作家名（0列目）で昇順ソート。同じ作家の商品が分断されると太線が正しく引けなくなるため。
+  // Array.sortは安定ソートなので、同じ作家内の並び順（グループ化された順）は保たれる。
+  rowEntries.sort(function(a, b) {
+    return String(a.row[0]).localeCompare(String(b.row[0]), 'ja');
+  });
+
+  const rows = rowEntries.map(function(entry) { return entry.row; });
+  const mismatchRowIndexes = []; // rows配列上のインデックス（0始まり）
+  rowEntries.forEach(function(entry, idx) {
+    if (entry.mismatch) mismatchRowIndexes.push(idx);
   });
 
   const sheet = buildProductSheet(INVENTORY_SHEET_BY_SKU, rows, headers);
