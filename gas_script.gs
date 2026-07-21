@@ -1039,7 +1039,7 @@ function updateInventorySheet() {
         artist: '', product: '',
         received: 0, sample: 0, reserved: 0, reservedRelease: 0,
         damaged: 0, returned: 0, acquired: 0, lost: 0,
-        carriedIn: 0, transferredOut: 0,
+        carriedIn: 0, transferredOut: 0, sampleReturned: 0,
         hasMemo: false,
       });
     }
@@ -1049,7 +1049,7 @@ function updateInventorySheet() {
   // 在庫変動ログの「種別」で認識される値の一覧
   // ※ここに無い文字列は switch 文のどのcaseにも一致せず、静かに集計から漏れる
   //   （実際に「買取在庫」と「買取済在庫」の表記違いでこの問題が起きたことがある）
-  const VALID_LOG_TYPES = ['納品', 'サンプル', '取り置き', '取り置き解消', '破損', '返却', '買取済在庫', '紛失', '繰越入庫', '振替出庫'];
+  const VALID_LOG_TYPES = ['納品', 'サンプル', '取り置き', '取り置き解消', '破損', '返却', '買取済在庫', '紛失', '繰越入庫', '振替出庫', 'サンプル返却'];
   const unrecognizedTypeRows = []; // 種別が空欄、または一覧にない値になっている行
 
   if (logSheet) {
@@ -1087,8 +1087,9 @@ function updateInventorySheet() {
         case '返却':       entry.returned += qty; break;
         case '買取済在庫':  entry.acquired += qty; break; // 現在庫には含めるが、売上集計には含めない（ロイヤリティレポート側で対応）
         case '紛失':       entry.lost += qty; break; // 紛失分は在庫数から減算する
-        case '繰越入庫':    entry.carriedIn += qty; break; // 他会期から入ってきた分。在庫数（理論値）には加算するが、納品済み(サンプル込)には含めない
-        case '振替出庫':  entry.transferredOut += qty; break; // 他会期へ出ていった分。在庫数（理論値）から減算するが、納品済み(サンプル込)には含めない
+        case '繰越入庫':    entry.carriedIn += qty; break; // 他会期から入ってきた分。在庫数（ログ集計）には加算するが、納品済み(サンプル込)には含めない
+        case '振替出庫':  entry.transferredOut += qty; break; // 他会期へ出ていった分。在庫数（ログ集計）から減算するが、納品済み(サンプル込)には含めない
+        case 'サンプル返却': entry.sampleReturned += qty; break; // 作家へサンプルを返却した分。在庫数（ログ集計）から減算する
       }
 
       // この行が基本行（商品一覧_確定）にない場合は新規追加対象にする
@@ -1108,7 +1109,7 @@ function updateInventorySheet() {
 
   // ---- 出力用の行を組み立て ----
   const headers = ['作家名', '作品名', '商品コード', '税込価格', 'サンプル数', '納品予定数',
-                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', '在庫数（理論値）', '推定販売数', '残在庫(実数)'];
+                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', 'サンプル返却', '在庫数（ログ集計）', '推定販売数', '残在庫(実数)'];
   const rows = [];
 
   baseOrder.forEach(function(key) {
@@ -1116,7 +1117,7 @@ function updateInventorySheet() {
     const log = logMap.get(key) || {
       received: 0, sample: 0, reserved: 0, reservedRelease: 0,
       damaged: 0, returned: 0, acquired: 0, lost: 0,
-      carriedIn: 0, transferredOut: 0,
+      carriedIn: 0, transferredOut: 0, sampleReturned: 0,
     };
     const codeInfo = codeMap.get(key) || { code: '', stock: '' };
 
@@ -1134,18 +1135,16 @@ function updateInventorySheet() {
     // サンプル販売不可分は在庫数から除外する
     const sampleExcluded = (base.sampleOk === '不可能') ? log.sample : 0;
 
-    // 在庫数＝納品済み＋買取済在庫＋繰越入庫－振替出庫－破損－返却－取り置き中－紛失－サンプル販売不可分
+    // 在庫数（ログ集計）＝納品済み＋買取済在庫＋繰越入庫－振替出庫－破損－返却－取り置き中－紛失
+    //   －サンプル返却－サンプル販売不可分
     // （販売は引かない＝会期末の実数カウントと比較するための理論値。繰越入庫・振替出庫・買取済在庫は
     //   「今回作家から新しく届いた点数」ではないため、納品済み(サンプル込)には含めない）
     const theoreticalStock = delivered + log.acquired + log.carriedIn - log.transferredOut
-      - log.damaged - log.returned - reservedNet - log.lost - sampleExcluded;
+      - log.damaged - log.returned - reservedNet - log.lost - log.sampleReturned - sampleExcluded;
 
     // 現在庫＝商品コード管理「在庫残数」の手入力値をそのまま反映（読み取り専用のミラー）
     const manualStock = codeInfo.stock;
     const hasManualStock = manualStock !== '' && manualStock !== null && manualStock !== undefined;
-
-    // 販売数＝在庫数－現在庫（手入力がまだなければ空欄のまま＝未集計とわかるようにする）
-    const estimatedSold = hasManualStock ? (theoreticalStock - Number(manualStock)) : '';
 
     rows.push([
       base.artist,
@@ -1159,8 +1158,9 @@ function updateInventorySheet() {
       log.lost === 0 ? '' : log.lost,
       log.damaged === 0 ? '' : log.damaged,
       log.returned === 0 ? '' : log.returned,
+      log.sampleReturned === 0 ? '' : log.sampleReturned,
       theoreticalStock === 0 ? '' : theoreticalStock,
-      estimatedSold,
+      '', // 推定販売数：後段で「在庫数（ログ集計）－残在庫(実数)」の数式を差し込む（同じ行の隣接セル参照）
       hasManualStock ? manualStock : '',
     ]);
   });
@@ -1172,13 +1172,24 @@ function updateInventorySheet() {
     return String(a[0]).localeCompare(String(b[0]), 'ja');
   });
 
+  // 推定販売数（列N＝13番目、0始まりで13）に「在庫数（ログ集計）－残在庫(実数)」の数式を差し込む。
+  // 列M＝在庫数（ログ集計）、列O＝残在庫(実数)は同じ行の隣接セルなので、行番号さえ分かれば
+  // シンプルな同一シート内参照で済む（ソート後の最終的な行位置を使って組み立てる）。
+  // 残在庫(実数)が空欄（会期末カウント未実施）の間は空欄のまま、という以前の挙動を
+  // IF文で再現している。値ではなく数式にしたことで、残在庫(実数)が更新されると
+  // スクリプトを再実行しなくても自動で再計算されるようになる。
+  rows.forEach(function(row, idx) {
+    const sheetRow = idx + 2; // ヘッダーが1行目なので、データはidx+2行目に書き込まれる
+    row[13] = '=IF(O' + sheetRow + '="","",M' + sheetRow + '-O' + sheetRow + ')';
+  });
+
   // ---- シートに書き込み ----
   const sheet = buildProductSheet(INVENTORY_SHEET, rows, headers);
   addArtistBorders(sheet, rows, headers);
 
-  // 「破損」「返却」列は普段見る必要が薄いため、デフォルトで折りたたんでおく（列番号10・11＝J・K列）
-  // 見たいときは列見出しの「+」をクリックすれば展開できる
-  sheet.hideColumns(10, 2);
+  // 「破損」「返却」「サンプル返却」列は普段見る必要が薄いため、デフォルトで折りたたんでおく
+  // （列番号10〜12＝J・K・L列）。見たいときは列見出しの「+」をクリックすれば展開できる
+  sheet.hideColumns(10, 3);
 
   let message = '完了！\n' + rows.length + '件の在庫データを更新しました。\n' +
     '※「残在庫(実数)」は商品コード管理の「在庫残数」を反映したものです。会期末のカウント結果はそちらに入力してください。';
@@ -1250,7 +1261,7 @@ function updateInventorySheetBySku() {
   const squareMap = getSquareSalesMap();
 
   const headers = ['作家名', '作品名', '商品コード', '税込価格', 'サンプル数', '納品予定数',
-                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', '在庫数（理論値）', '残在庫(実数)', '推定販売数', 'Square販売数'];
+                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', 'サンプル返却', '在庫数（ログ集計）', '残在庫(実数)', '推定販売数', 'Square販売数'];
 
   function toNum(v) {
     const n = Number(v);
@@ -1261,7 +1272,8 @@ function updateInventorySheetBySku() {
   }
 
   // 在庫管理(商品ごと)の列：0作家名 1作品名 2商品コード 3税込価格 4サンプル数 5納品予定数
-  // 6納品済み(サンプル込) 7取置き中 8紛失 9破損 10返却 11在庫数（理論値） 12推定販売数 13残在庫(実数)
+  // 6納品済み(サンプル込) 7取置き中 8紛失 9破損 10返却 11サンプル返却
+  // 12在庫数（ログ集計） 13推定販売数 14残在庫(実数)
   const groupMap = new Map(); // 商品コード -> 集計用オブジェクト
   const groupOrder = [];
   const passthroughRows = []; // 商品コードが空の行はそのまま出力（末尾に追加）
@@ -1276,8 +1288,8 @@ function updateInventorySheetBySku() {
     if (!code) {
       passthroughRows.push([
         artist, product, row[2], row[3],
-        row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], row[13],
-        row[12], // 推定販売数（商品ごとシートの値そのまま）
+        row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], row[12], row[14],
+        row[13], // 推定販売数（商品ごとシートの値そのまま、数式の計算結果が入っている）
         squareNet,
       ]);
       continue;
@@ -1286,7 +1298,7 @@ function updateInventorySheetBySku() {
     if (!groupMap.has(code)) {
       groupMap.set(code, {
         artist: artist, product: product, taxPrice: row[3],
-        sample: 0, deliveryPlanned: 0, delivered: 0, reserved: 0, lost: 0, damaged: 0, returned: 0,
+        sample: 0, deliveryPlanned: 0, delivered: 0, reserved: 0, lost: 0, damaged: 0, returned: 0, sampleReturned: 0,
         stock: 0, currentStock: 0, hasCurrentStock: false,
         estimatedSold: 0, hasEstimatedSold: false,
         squareSold: 0, hasSquareSold: false,
@@ -1302,9 +1314,10 @@ function updateInventorySheetBySku() {
     g.lost += toNum(row[8]);
     g.damaged += toNum(row[9]);
     g.returned += toNum(row[10]);
-    g.stock += toNum(row[11]);
-    if (hasValue(row[13])) { g.currentStock += toNum(row[13]); g.hasCurrentStock = true; }
-    if (hasValue(row[12]))  { g.estimatedSold += toNum(row[12]); g.hasEstimatedSold = true; }
+    g.sampleReturned += toNum(row[11]);
+    g.stock += toNum(row[12]);
+    if (hasValue(row[14])) { g.currentStock += toNum(row[14]); g.hasCurrentStock = true; }
+    if (hasValue(row[13]))  { g.estimatedSold += toNum(row[13]); g.hasEstimatedSold = true; } // 推定販売数（数式の計算結果）
     if (squareNet !== '')  { g.squareSold += toNum(squareNet); g.hasSquareSold = true; }
   }
 
@@ -1323,6 +1336,7 @@ function updateInventorySheetBySku() {
       g.lost === 0 ? '' : g.lost,
       g.damaged === 0 ? '' : g.damaged,
       g.returned === 0 ? '' : g.returned,
+      g.sampleReturned === 0 ? '' : g.sampleReturned,
       g.stock === 0 ? '' : g.stock,
       g.hasCurrentStock ? g.currentStock : '',
       estimatedSoldVal,
@@ -1333,7 +1347,7 @@ function updateInventorySheetBySku() {
   });
 
   passthroughRows.forEach(function(r) {
-    const est = r[13], sq = r[14];
+    const est = r[14], sq = r[15];
     const mismatch = est !== '' && sq !== '' && Number(est) !== Number(sq);
     rowEntries.push({ row: r, mismatch: mismatch });
   });
@@ -1353,13 +1367,14 @@ function updateInventorySheetBySku() {
   const sheet = buildProductSheet(INVENTORY_SHEET_BY_SKU, rows, headers);
   addArtistBorders(sheet, rows, headers);
 
-  // 「破損」「返却」列は普段見る必要が薄いため、デフォルトで折りたたんでおく（列番号10・11＝J・K列）
-  sheet.hideColumns(10, 2);
+  // 「破損」「返却」「サンプル返却」列は普段見る必要が薄いため、デフォルトで折りたたんでおく
+  // （列番号10〜12＝J・K・L列）
+  sheet.hideColumns(10, 3);
 
-  // 推定販売数(14列目)とSquare販売数(15列目)が不一致の行は背景色を変える
+  // 推定販売数(15列目)とSquare販売数(16列目)が不一致の行は背景色を変える
   mismatchRowIndexes.forEach(function(idx) {
-    sheet.getRange(idx + 2, 14).setBackground('#f4cccc');
     sheet.getRange(idx + 2, 15).setBackground('#f4cccc');
+    sheet.getRange(idx + 2, 16).setBackground('#f4cccc');
   });
 
   SpreadsheetApp.getUi().alert(
