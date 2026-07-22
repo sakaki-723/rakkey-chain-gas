@@ -840,6 +840,13 @@ function updateLogProductDropdown(e) {
 // 既存の行のプルダウンは自動では追従しない（onEditは新たに編集された
 // セルにしか反応しないため）。この関数を実行すると、シート全体を
 // 再スキャンしてB列の内容をもとにC列のプルダウンをすべて設定し直す。
+//
+// 【パフォーマンスについて】
+// 1行ずつgetValue()/setDataValidation()を呼ぶと、行数分だけサーバーとの
+// 通信が発生して重くなる（1行につきB列読み取り×1・プルダウン設定×1で、
+// 実質行数×2回の通信）。そのため、B列は1回のまとめ読み、プルダウンの
+// 設定・解除もsetDataValidations()で範囲全体を1回にまとめて書き込む
+// ことで、行数に関わらず通信回数をほぼ一定に抑えている。
 // ============================================================
 function refreshAllLogProductDropdowns() {
   const ui = SpreadsheetApp.getUi();
@@ -856,16 +863,59 @@ function refreshAllLogProductDropdowns() {
     return;
   }
 
-  const finalData = finalSheet.getDataRange().getValues();
   const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    ui.alert('在庫変動ログにデータがありません。');
+    return;
+  }
+
+  const finalData = finalSheet.getDataRange().getValues();
+
+  // 事前に「正規化した作家名 → 作品名一覧」のマップを1回だけ作っておく
+  // （行ごとにfinalDataを毎回スキャンし直すのは無駄なため）
+  const productsByArtist = new Map();
+  for (let i = 1; i < finalData.length; i++) {
+    const rowArtist = String(finalData[i][0] || '');
+    const productName = finalData[i][1];
+    if (!rowArtist || !productName) continue;
+    const key = normalizeToken(rowArtist);
+    if (!productsByArtist.has(key)) productsByArtist.set(key, []);
+    const list = productsByArtist.get(key);
+    if (list.indexOf(productName) === -1) list.push(productName);
+  }
+
+  // B列（作家名）をまとめて1回で読み込む
+  const numRows = lastRow - 1; // ヘッダーを除いた行数
+  const artistNames = sheet.getRange(2, 2, numRows, 1).getValues();
+
+  // C列に設定するデータ検証ルールを、行ごとに配列として組み立てる
+  // （nullを入れるとその行のプルダウンは解除される）
+  const validations = [];
   let updatedCount = 0;
 
-  for (let row = 2; row <= lastRow; row++) {
-    const artistName = String(sheet.getRange(row, 2).getValue() || '').trim();
-    if (!artistName) continue;
-    applyLogProductDropdown(sheet, row, finalData);
+  for (let r = 0; r < numRows; r++) {
+    const artistName = String(artistNames[r][0] || '').trim();
+    if (!artistName) {
+      validations.push([null]);
+      continue;
+    }
+
+    const productNames = productsByArtist.get(normalizeToken(artistName)) || [];
+    if (productNames.length === 0) {
+      // 商品一覧_確定に該当作家がいない場合（前会期の余り在庫など）は手入力を許可
+      validations.push([null]);
+    } else {
+      const rule = SpreadsheetApp.newDataValidation()
+        .requireValueInList(productNames, true)
+        .setAllowInvalid(true) // 手入力も許可（未登録作品メモ運用のため）
+        .build();
+      validations.push([rule]);
+    }
     updatedCount++;
   }
+
+  // C列（作品名）へ一括書き込み
+  sheet.getRange(2, 3, numRows, 1).setDataValidations(validations);
 
   ui.alert('完了！\n在庫変動ログの' + updatedCount + '行分、作品名のプルダウンを更新しました。');
 }
