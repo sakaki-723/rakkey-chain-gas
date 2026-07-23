@@ -115,9 +115,18 @@ function buildProductSheet(sheetName, rows, headers) {
   sheet.autoResizeColumns(1, headers.length);
   ensureHeaderColumnWidth(sheet, headers, rows);
 
-  for (let i = 0; i < rows.length; i++) {
-    const bg = i % 2 === 0 ? '#ffffff' : '#e8f0fe';
-    sheet.getRange(i + 2, 1, 1, headers.length).setBackground(bg);
+  // 交互背景色（縞模様）。1行ずつsetBackground()すると行数分サーバー通信が発生して
+  // 重くなるため、全行分の色を2次元配列としてまとめて組み立て、setBackgrounds()で
+  // 1回にまとめて書き込む。
+  if (rows.length > 0) {
+    const rowColors = [];
+    for (let i = 0; i < rows.length; i++) {
+      const bg = i % 2 === 0 ? '#ffffff' : '#e8f0fe';
+      const colorRow = [];
+      for (let c = 0; c < headers.length; c++) colorRow.push(bg);
+      rowColors.push(colorRow);
+    }
+    sheet.getRange(2, 1, rows.length, headers.length).setBackgrounds(rowColors);
   }
 
   return sheet;
@@ -319,13 +328,22 @@ function checkArtistsAgainstMaster(sheet, rows) {
   }
 
   const missing = new Set();
-  for (let i = 0; i < rows.length; i++) {
-    const artist = String(rows[i][0] || '').trim();
-    if (!artist) continue;
-    if (!masterNames.has(normalizeToken(artist))) {
-      missing.add(artist);
-      sheet.getRange(i + 2, 1).setBackground('#f4cccc'); // 薄い赤
+  if (rows.length > 0) {
+    // A列の現在の背景色（buildProductSheetで設定済みの縞模様）を1回で読み込み、
+    // 未登録の行だけ薄い赤に差し替えてから、最後に1回でまとめて書き戻す。
+    // 1行ずつsetBackground()すると行数分サーバー通信が発生して重くなるため。
+    const colA = sheet.getRange(2, 1, rows.length, 1);
+    const bgColors = colA.getBackgrounds();
+
+    for (let i = 0; i < rows.length; i++) {
+      const artist = String(rows[i][0] || '').trim();
+      if (!artist) continue;
+      if (!masterNames.has(normalizeToken(artist))) {
+        missing.add(artist);
+        bgColors[i][0] = '#f4cccc'; // 薄い赤
+      }
     }
+    colA.setBackgrounds(bgColors);
   }
   return Array.from(missing);
 }
@@ -986,6 +1004,17 @@ function updateProductCodeSheetCore(finalSheet) {
   const seenInThisRun = new Set(); // 同一実行内での重複追加防止
   let updatedCount = 0;
 
+  // 既存行のB列（ラベル表示作家名）・D列（税込価格）は、1行ずつgetRange().setValue()すると
+  // 行数分だけサーバー通信が発生して重くなるため、まずexistingData（読み込み済み）をもとに
+  // 列全体を配列として組み立て、最後に1回でまとめて書き込む方式にしている。
+  const totalExistingRows = existingData.length - 1; // ヘッダーを除いた行数
+  const bColumnValues = []; // B列：ラベル表示作家名
+  const dColumnValues = []; // D列：税込価格（数式）
+  for (let i = 1; i < existingData.length; i++) {
+    bColumnValues.push([existingData[i][1]]); // 現状維持がデフォルト（対象外の行はそのまま）
+    dColumnValues.push([existingData[i][3]]); // 同上
+  }
+
   for (let i = 1; i < finalData.length; i++) {
     const artist = String(finalData[i][0] || '').trim();
     const product = String(finalData[i][1] || '').trim();
@@ -997,8 +1026,9 @@ function updateProductCodeSheetCore(finalSheet) {
     if (existingRowMap.has(key)) {
       // 既存行：D列（税込価格）を数式に、ラベル表示作家名だけ上書き（作家マスタの最新値に追従させる）
       const rowNum = existingRowMap.get(key);
-      codeSheet.getRange(rowNum, 4).setFormula(buildTaxPriceFormula(rowNum)); // D列：税込価格（数式）
-      codeSheet.getRange(rowNum, 2).setValue(labelArtist); // B列：ラベル表示作家名
+      const arrIdx = rowNum - 2; // シート上の行番号→配列インデックス（2行目が配列の0番目）
+      bColumnValues[arrIdx] = [labelArtist];
+      dColumnValues[arrIdx] = [buildTaxPriceFormula(rowNum)];
       updatedCount++;
       continue;
     }
@@ -1010,14 +1040,21 @@ function updateProductCodeSheetCore(finalSheet) {
     newRows.push([artist, labelArtist, product, '', '', '', '']);
   }
 
+  // B列・D列（既存分）を1回でまとめて書き込む
+  if (totalExistingRows > 0) {
+    codeSheet.getRange(2, 2, totalExistingRows, 1).setValues(bColumnValues);
+    codeSheet.getRange(2, 4, totalExistingRows, 1).setValues(dColumnValues);
+  }
+
   if (newRows.length > 0) {
     const startRow = codeSheet.getLastRow() + 1;
     codeSheet.getRange(startRow, 1, newRows.length, 7).setValues(newRows);
-    // 新規追加した行のD列（税込価格）に数式を設定
+    // 新規追加した行のD列（税込価格）にも、1回でまとめて数式を設定する
+    const newDColumnValues = [];
     for (let r = 0; r < newRows.length; r++) {
-      const rowNum = startRow + r;
-      codeSheet.getRange(rowNum, 4).setFormula(buildTaxPriceFormula(rowNum));
+      newDColumnValues.push([buildTaxPriceFormula(startRow + r)]);
     }
+    codeSheet.getRange(startRow, 4, newRows.length, 1).setValues(newDColumnValues);
   }
 
   return newRows.length;
@@ -1470,10 +1507,17 @@ function updateInventorySheetBySku() {
   sheet.hideColumns(10, 3);
 
   // 推定販売数(15列目)とSquare販売数(16列目)が不一致の行は背景色を変える
-  mismatchRowIndexes.forEach(function(idx) {
-    sheet.getRange(idx + 2, 15).setBackground('#f4cccc');
-    sheet.getRange(idx + 2, 16).setBackground('#f4cccc');
-  });
+  // 1行ずつsetBackground()すると不一致件数分サーバー通信が発生するため、
+  // 該当2列分の背景色をまとめて読み込み、不一致行だけ差し替えてから1回で書き戻す。
+  if (rows.length > 0) {
+    const mismatchCols = sheet.getRange(2, 15, rows.length, 2);
+    const mismatchColors = mismatchCols.getBackgrounds();
+    mismatchRowIndexes.forEach(function(idx) {
+      mismatchColors[idx][0] = '#f4cccc';
+      mismatchColors[idx][1] = '#f4cccc';
+    });
+    mismatchCols.setBackgrounds(mismatchColors);
+  }
 
   SpreadsheetApp.getUi().alert(
     '完了！\n' + rows.length + '件のSKU別在庫データを更新しました。\n' +
