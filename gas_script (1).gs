@@ -115,9 +115,18 @@ function buildProductSheet(sheetName, rows, headers) {
   sheet.autoResizeColumns(1, headers.length);
   ensureHeaderColumnWidth(sheet, headers, rows);
 
-  for (let i = 0; i < rows.length; i++) {
-    const bg = i % 2 === 0 ? '#ffffff' : '#e8f0fe';
-    sheet.getRange(i + 2, 1, 1, headers.length).setBackground(bg);
+  // 交互背景色（縞模様）。1行ずつsetBackground()すると行数分サーバー通信が発生して
+  // 重くなるため、全行分の色を2次元配列としてまとめて組み立て、setBackgrounds()で
+  // 1回にまとめて書き込む。
+  if (rows.length > 0) {
+    const rowColors = [];
+    for (let i = 0; i < rows.length; i++) {
+      const bg = i % 2 === 0 ? '#ffffff' : '#e8f0fe';
+      const colorRow = [];
+      for (let c = 0; c < headers.length; c++) colorRow.push(bg);
+      rowColors.push(colorRow);
+    }
+    sheet.getRange(2, 1, rows.length, headers.length).setBackgrounds(rowColors);
   }
 
   return sheet;
@@ -217,6 +226,13 @@ function updatePlanList() {
     return;
   }
 
+  // 作家名（0列目）で昇順ソート。フォーム回答順のままだと同じ作家の行が
+  // 途中で分断され、addArtistBordersの太線が正しく引けなくなるため。
+  // Array.sortは安定ソートなので、同じ作家内の作品の並び順（フォーム回答順）は保たれる。
+  rows.sort(function(a, b) {
+    return String(a[0]).localeCompare(String(b[0]), 'ja');
+  });
+
   const planSheet = buildProductSheet(PRODUCT_SHEET_PLAN, rows, headers);
   addArtistBorders(planSheet, rows, headers);
   protectSheet(planSheet, '商品一覧_予定はスクリプトが自動管理します。手動編集不可。');
@@ -278,6 +294,12 @@ function buildFinalProductList() {
     return null;
   }
 
+  // 作家名（0列目）で昇順ソート。フォーム回答順のままだと同じ作家の行が
+  // 途中で分断され、addArtistBordersの太線が正しく引けなくなるため。
+  rows.sort(function(a, b) {
+    return String(a[0]).localeCompare(String(b[0]), 'ja');
+  });
+
   const finalSheet = buildProductSheet(PRODUCT_SHEET_FINAL, rows, headers);
   addArtistBorders(finalSheet, rows, headers);
   protectSheet(finalSheet, '商品一覧_確定はスクリプトが自動管理します。手動編集不可。');
@@ -306,13 +328,22 @@ function checkArtistsAgainstMaster(sheet, rows) {
   }
 
   const missing = new Set();
-  for (let i = 0; i < rows.length; i++) {
-    const artist = String(rows[i][0] || '').trim();
-    if (!artist) continue;
-    if (!masterNames.has(normalizeToken(artist))) {
-      missing.add(artist);
-      sheet.getRange(i + 2, 1).setBackground('#f4cccc'); // 薄い赤
+  if (rows.length > 0) {
+    // A列の現在の背景色（buildProductSheetで設定済みの縞模様）を1回で読み込み、
+    // 未登録の行だけ薄い赤に差し替えてから、最後に1回でまとめて書き戻す。
+    // 1行ずつsetBackground()すると行数分サーバー通信が発生して重くなるため。
+    const colA = sheet.getRange(2, 1, rows.length, 1);
+    const bgColors = colA.getBackgrounds();
+
+    for (let i = 0; i < rows.length; i++) {
+      const artist = String(rows[i][0] || '').trim();
+      if (!artist) continue;
+      if (!masterNames.has(normalizeToken(artist))) {
+        missing.add(artist);
+        bgColors[i][0] = '#f4cccc'; // 薄い赤
+      }
     }
+    colA.setBackgrounds(bgColors);
   }
   return Array.from(missing);
 }
@@ -342,15 +373,23 @@ function updateFinalList() {
 
   // 続けて納品確認書プルダウンと商品コード管理を更新
   const dropdownCount = setupInvoiceDropdownCore(finalSheet);
-  const codeAddedCount = updateProductCodeSheetCore(finalSheet);
+  const codeResult = updateProductCodeSheetCore(finalSheet);
 
   let message = '完了！\n' +
     result.rowCount + '件の確定商品データを展開しました。\n' +
     '納品確認書プルダウン：' + dropdownCount + '名の作家名を設定しました。\n' +
-    '商品コード管理：新規' + codeAddedCount + '件を追記しました。';
+    '商品コード管理：新規' + codeResult.newRowCount + '件を追記しました。';
 
   if (result.missingArtists.length > 0) {
-    message += '\n\n⚠️ 作家マスタに見つからない作家名（セルを赤くしています）：\n' + result.missingArtists.join('\n');
+    message += '\n\n⚠️ 商品一覧_確定で作家マスタに見つからない作家名（セルを赤くしています）：\n' + result.missingArtists.join('\n');
+  }
+  if (codeResult.missingArtistsInCode.length > 0) {
+    message += '\n\n⚠️ 商品コード管理で作家マスタに見つからない作家名（A列を赤くしています）：\n' + codeResult.missingArtistsInCode.join('\n');
+  }
+  if (codeResult.duplicateList.length > 0) {
+    message += '\n\n⚠️ 商品コード管理内で同じ商品（作家名＋作品名）に複数の行・複数の商品コードが振られています（F列を薄いオレンジにしています）：\n' +
+      codeResult.duplicateList.join('\n') +
+      '\n\nどちらか一方の行を削除・統合してください。放置すると在庫数が二重にカウントされる可能性があります。';
   }
 
   SpreadsheetApp.getUi().alert(message);
@@ -427,6 +466,14 @@ function onEdit(e) {
     fillLogCheckDate(e);
   }
 
+  // 商品コード管理の作家名（A列）・作品名（C列）が編集されたら、
+  // 同じ組み合わせの行が既に存在していないか即座にチェックする
+  // （商品コード管理は在庫変動ログと違ってこのファイル自身の中にあるので、
+  //   簡易トリガーのままで問題なく他シートを参照できる）
+  if (editedSheet === PRODUCT_CODE_SHEET) {
+    checkProductCodeDuplicate(e);
+  }
+
   // ※納品確認書H3（作家名プルダウン）の処理はここでは行わない。
   //   fillInvoice()はマスタファイルをopenByIdで開く処理を含んでおり、
   //   簡易トリガー（この関数）は「バインドされているファイル以外」への
@@ -436,6 +483,125 @@ function onEdit(e) {
   //   必要がある（onFormSubmitと同じ理由・同じ設定方法）。
   //   設定方法：GASエディタ→左サイドバーの時計アイコン（トリガー）→トリガーを追加→
   //   関数を選択「onInvoiceArtistChange」→イベントの種類「編集時」→保存
+}
+
+// ============================================================
+// 商品コード管理：作家名（A列）・作品名（C列）が編集されたとき、
+// 同じ組み合わせ（正規化して比較）の行が既に他にないかチェックする
+// 複数行・複数セルの一括貼り付けにも対応
+// ============================================================
+function checkProductCodeDuplicate(e) {
+  const sheet = e.range.getSheet();
+
+  // 編集範囲がA列またはC列にかかっていない場合は対象外
+  const startCol = e.range.getColumn();
+  const numCols = e.range.getNumColumns();
+  const touchesA = startCol <= 1 && startCol + numCols - 1 >= 1;
+  const touchesC = startCol <= 3 && startCol + numCols - 1 >= 3;
+  if (!touchesA && !touchesC) return;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  // 全行のA列（作家名）・C列（作品名）をまとめて読み込む
+  const allArtists = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  const allProducts = sheet.getRange(2, 3, lastRow - 1, 1).getValues();
+
+  const startRow = e.range.getRow();
+  const numRows = e.range.getNumRows();
+  const messages = [];
+
+  for (let r = 0; r < numRows; r++) {
+    const row = startRow + r;
+    if (row <= 1) continue; // ヘッダー行は対象外
+
+    // e.valueには頼らず実際のセル値を読み直す（複数セルへのコピペ対策）
+    const artist = String(sheet.getRange(row, 1).getValue() || '').trim();
+    const product = String(sheet.getRange(row, 3).getValue() || '').trim();
+    if (!artist || !product) continue;
+
+    const key = normalizeToken(artist) + '|' + normalizeToken(product);
+    const duplicates = [];
+    for (let i = 0; i < allArtists.length; i++) {
+      const rowNum = i + 2;
+      if (rowNum === row) continue; // 自分自身はスキップ
+      const existingArtist = String(allArtists[i][0] || '').trim();
+      const existingProduct = String(allProducts[i][0] || '').trim();
+      if (!existingArtist || !existingProduct) continue;
+      const existingKey = normalizeToken(existingArtist) + '|' + normalizeToken(existingProduct);
+      if (existingKey === key) {
+        duplicates.push(existingArtist + '／' + existingProduct + '（' + rowNum + '行目）');
+      }
+    }
+
+    if (duplicates.length > 0) {
+      messages.push('入力値：' + artist + '／' + product + '（' + row + '行目）\n重複している行：\n' + duplicates.join('\n'));
+    }
+  }
+
+  if (messages.length > 0) {
+    SpreadsheetApp.getUi().alert(
+      '⚠️ 商品コード管理に重複の可能性があります\n\n' + messages.join('\n\n') +
+      '\n\n同じ商品に2つの商品コードが振られてしまうと在庫管理が二重にカウントされる原因になります。\nどちらか一方の行を削除・統合してください。'
+    );
+  }
+}
+
+// ============================================================
+// 商品コード管理シート全体を一括スキャンし、「作家名＋作品名」の組み合わせが
+// 重複している行を検出してF列（商品コード）を色付けする共通関数。
+// ②-1/②-2（updateProductCodeSheetCore）・③（updateInventorySheet）の
+// 両方から呼ばれる（商品コード管理を更新するタイミングならどちらでも検知できるように）。
+// 戻り値：重複の説明文の配列（警告メッセージ用）
+// ============================================================
+function detectAndHighlightProductCodeDuplicates(codeSheet) {
+  if (!codeSheet) return [];
+  const lastRow = codeSheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const totalRows = lastRow - 1;
+  const acData = codeSheet.getRange(2, 1, totalRows, 3).getValues(); // A:C列（作家名・ラベル・作品名）
+
+  const keyToRowNums = new Map();
+  const rowInfoByKey = new Map(); // key -> {artist, product}（メッセージ表示用に1件だけ覚えておく）
+
+  for (let i = 0; i < totalRows; i++) {
+    const artist = String(acData[i][0] || '').trim();
+    const product = String(acData[i][2] || '').trim();
+    if (!artist || !product) continue;
+    const key = normalizeToken(artist) + '|' + normalizeToken(product);
+    const rowNum = i + 2;
+    if (!keyToRowNums.has(key)) {
+      keyToRowNums.set(key, []);
+      rowInfoByKey.set(key, { artist: artist, product: product });
+    }
+    keyToRowNums.get(key).push(rowNum);
+  }
+
+  const duplicateRowNums = new Set();
+  const duplicateList = [];
+  keyToRowNums.forEach(function(rowNums, key) {
+    if (rowNums.length < 2) return;
+    const info = rowInfoByKey.get(key);
+    rowNums.forEach(function(rn) { duplicateRowNums.add(rn); });
+    duplicateList.push(info.artist + '／' + info.product + '（' + rowNums.map(function(rn) { return rn + '行目'; }).join('・') + '）');
+  });
+
+  // F列（商品コード）に色を付ける。A列（作家マスタ照合）・C列（手書き検出）とは
+  // 別の列なので互いに競合しない。1行ずつではなく一括で読み書きする。
+  const codeCol = codeSheet.getRange(2, 6, totalRows, 1);
+  const codeColors = codeCol.getBackgrounds();
+  for (let i = 0; i < totalRows; i++) {
+    const rowNum = i + 2;
+    if (duplicateRowNums.has(rowNum)) {
+      codeColors[i][0] = '#f9cb9c'; // 薄いオレンジ（「同じ商品に複数コードが振られている」目印）
+    } else if (codeColors[i][0] === '#f9cb9c') {
+      codeColors[i][0] = '#ffffff'; // 解消された行は色を戻す
+    }
+  }
+  codeCol.setBackgrounds(codeColors);
+
+  return duplicateList;
 }
 
 // ============================================================
@@ -465,10 +631,14 @@ function fillInvoice(artistName) {
 
   // 確定シートから該当作家の商品を取得
   // 確定シートの列: 0:作家名 1:作品名 2:サンプル数 3:サンプル販売可否 4:納品数 5:税抜価格 6:税込価格 7:備考
+  // ※完全一致ではなくnormalizeToken（全角半角・大文字小文字・空白の違いを吸収）で突き合わせる。
+  //   H3のプルダウン自体は商品一覧_確定の値をそのまま使っているため通常はここでズレないはずだが、
+  //   念のため他の箇所と同じ正規化方式に揃えている。
   const finalData = finalSheet.getDataRange().getValues();
+  const normalizedTargetArtist = normalizeToken(artistName);
   const products = [];
   for (let i = 1; i < finalData.length; i++) {
-    if (String(finalData[i][0]).trim() === String(artistName).trim()) {
+    if (normalizeToken(String(finalData[i][0])) === normalizedTargetArtist) {
       products.push({
         name:     finalData[i][1],
         sample:   finalData[i][2],
@@ -486,12 +656,16 @@ function fillInvoice(artistName) {
   // 作家マスタの列: A(0):作家番号 B(1):アーティスト名 C(2):ラベル表記名 D(3):instagram
   // E(4):ジャンル F(5):メールアドレス G(6):住所1 H(7):住所2 I(8):本名
   // J(9):電話番号 K(10):振込先情報 L(11):取引申請書送付済み M(12):取引申請書受信済み N(13):備考
+  // ※こちらもnormalizeTokenで突き合わせる。ただし住所・電話番号・振込先という個人情報を
+  //   人の確認なしに自動で差し込む処理のため、検索機能のような部分一致（トークンの重なり
+  //   だけで拾う方式）はあえて使わない。似た名前の別の作家の個人情報を誤って引っ張って
+  //   しまうリスクを避けるため、正規化後の完全一致までに留めている。
   const masterSheet = getArtistMasterSheet();
   let realName = '', address = '', tel = '', bankInfo = '';
   if (masterSheet) {
     const masterData = masterSheet.getDataRange().getValues();
     for (let i = 1; i < masterData.length; i++) {
-      if (String(masterData[i][1]).trim() === String(artistName).trim()) {
+      if (normalizeToken(String(masterData[i][1])) === normalizedTargetArtist) {
         address  = masterData[i][6] || '';  // G列: 住所1
         realName = masterData[i][8] || '';  // I列: 本名
         tel      = masterData[i][9] || '';  // J列: 電話番号
@@ -672,6 +846,7 @@ function onOpen() {
     .addItem('納品確認書プルダウンのみ再設定', 'setupInvoiceDropdown')
     .addItem('会期プルダウンを更新（ロイヤリティレポート!C13・納品確認書!C13）', 'setupRoyaltyPeriodDropdown')
     .addItem('フォーム受取チェックを再実行（手動）', 'recheckFormReceipts')
+    .addItem('在庫変動ログの商品名プルダウンを一斉更新', 'refreshAllLogProductDropdowns')
     .addToUi();
   // ※「🔍 作家名で検索してNo.を入力」は第6回からマスタファイル側の専用メニューに移管した
 }
@@ -754,6 +929,48 @@ function extractTokens(str) {
 // 在庫変動ログ：作家名（B列）を編集したら、同じ行の作品名（C列）に
 // その作家の商品一覧_確定上の作品名リストをデータの入力規則として設定する
 // ============================================================
+// ============================================================
+// 在庫変動ログの1行分（B列：作家名）に対して、C列（作品名）の
+// プルダウンを設定する共通処理。onEdit経由の自動更新・メニューからの
+// 一斉更新の両方から呼ばれる。
+// ============================================================
+function applyLogProductDropdown(sheet, row, finalData) {
+  const artistName = String(sheet.getRange(row, 2).getValue() || '').trim();
+  const productCell = sheet.getRange(row, 3); // C列：作品名
+
+  if (!artistName || !finalData) {
+    productCell.clearDataValidations();
+    return;
+  }
+
+  const normalizedTarget = normalizeToken(artistName);
+  const productNames = [];
+  for (let i = 1; i < finalData.length; i++) {
+    const rowArtist = String(finalData[i][0] || '');
+    if (normalizeToken(rowArtist) === normalizedTarget) {
+      const productName = finalData[i][1];
+      if (productName && productNames.indexOf(productName) === -1) {
+        productNames.push(productName);
+      }
+    }
+  }
+
+  if (productNames.length === 0) {
+    // 商品一覧_確定に該当作家がいない場合（前会期の余り在庫など）は手入力を許可
+    productCell.clearDataValidations();
+    return;
+  }
+
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(productNames, true)
+    .setAllowInvalid(true) // 手入力も許可（未登録作品メモ運用のため）
+    .build();
+  productCell.setDataValidation(rule);
+}
+
+// ============================================================
+// onEdit経由：編集された範囲（B列を含む場合）だけプルダウンを更新する
+// ============================================================
 function updateLogProductDropdown(e) {
   const sheet = e.range.getSheet();
   const startRow = e.range.getRow();
@@ -771,42 +988,97 @@ function updateLogProductDropdown(e) {
   for (let r = 0; r < numRows; r++) {
     const row = startRow + r;
     if (row <= 1) continue; // ヘッダー行は対象外
+    applyLogProductDropdown(sheet, row, finalData);
+  }
+}
 
-    // e.valueには頼らず、実際のセル値を読み直す
-    // （e.valueは単一セル編集時しかセットされず、複数セルへのコピペでは
-    //   undefinedになってしまうため、貼り付けだと反応しない原因になっていた）
-    const artistName = String(sheet.getRange(row, 2).getValue() || '').trim();
-    const productCell = sheet.getRange(row, 3); // C列：作品名
+// ============================================================
+// メニュー実行用：在庫変動ログの全行を対象に、C列（作品名）の
+// プルダウンを一斉更新する。
+// 【使いどころ】B列（作家名）が先に入力されていた行は、その時点では
+// まだ商品一覧_確定が存在しない・作家名が一致しない等の理由でプルダウンが
+// 未設定のまま残ることがある。そのままだと後から商品一覧_確定が更新されても、
+// 既存の行のプルダウンは自動では追従しない（onEditは新たに編集された
+// セルにしか反応しないため）。この関数を実行すると、シート全体を
+// 再スキャンしてB列の内容をもとにC列のプルダウンをすべて設定し直す。
+//
+// 【パフォーマンスについて】
+// 1行ずつgetValue()/setDataValidation()を呼ぶと、行数分だけサーバーとの
+// 通信が発生して重くなる（1行につきB列読み取り×1・プルダウン設定×1で、
+// 実質行数×2回の通信）。そのため、B列は1回のまとめ読み、プルダウンの
+// 設定・解除もsetDataValidations()で範囲全体を1回にまとめて書き込む
+// ことで、行数に関わらず通信回数をほぼ一定に抑えている。
+// ============================================================
+function refreshAllLogProductDropdowns() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(LOG_SHEET_NAME);
+  const finalSheet = ss.getSheetByName(PRODUCT_SHEET_FINAL);
 
-    if (!artistName || !finalData) {
-      productCell.clearDataValidations();
+  if (!sheet) {
+    ui.alert('シート「' + LOG_SHEET_NAME + '」が見つかりません。');
+    return;
+  }
+  if (!finalSheet) {
+    ui.alert('シート「' + PRODUCT_SHEET_FINAL + '」が見つかりません。\n先に「② 納品確定を更新」を実行してください。');
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    ui.alert('在庫変動ログにデータがありません。');
+    return;
+  }
+
+  const finalData = finalSheet.getDataRange().getValues();
+
+  // 事前に「正規化した作家名 → 作品名一覧」のマップを1回だけ作っておく
+  // （行ごとにfinalDataを毎回スキャンし直すのは無駄なため）
+  const productsByArtist = new Map();
+  for (let i = 1; i < finalData.length; i++) {
+    const rowArtist = String(finalData[i][0] || '');
+    const productName = finalData[i][1];
+    if (!rowArtist || !productName) continue;
+    const key = normalizeToken(rowArtist);
+    if (!productsByArtist.has(key)) productsByArtist.set(key, []);
+    const list = productsByArtist.get(key);
+    if (list.indexOf(productName) === -1) list.push(productName);
+  }
+
+  // B列（作家名）をまとめて1回で読み込む
+  const numRows = lastRow - 1; // ヘッダーを除いた行数
+  const artistNames = sheet.getRange(2, 2, numRows, 1).getValues();
+
+  // C列に設定するデータ検証ルールを、行ごとに配列として組み立てる
+  // （nullを入れるとその行のプルダウンは解除される）
+  const validations = [];
+  let updatedCount = 0;
+
+  for (let r = 0; r < numRows; r++) {
+    const artistName = String(artistNames[r][0] || '').trim();
+    if (!artistName) {
+      validations.push([null]);
       continue;
     }
 
-    const normalizedTarget = normalizeToken(artistName);
-    const productNames = [];
-    for (let i = 1; i < finalData.length; i++) {
-      const rowArtist = String(finalData[i][0] || '');
-      if (normalizeToken(rowArtist) === normalizedTarget) {
-        const productName = finalData[i][1];
-        if (productName && productNames.indexOf(productName) === -1) {
-          productNames.push(productName);
-        }
-      }
-    }
-
+    const productNames = productsByArtist.get(normalizeToken(artistName)) || [];
     if (productNames.length === 0) {
       // 商品一覧_確定に該当作家がいない場合（前会期の余り在庫など）は手入力を許可
-      productCell.clearDataValidations();
-      continue;
+      validations.push([null]);
+    } else {
+      const rule = SpreadsheetApp.newDataValidation()
+        .requireValueInList(productNames, true)
+        .setAllowInvalid(true) // 手入力も許可（未登録作品メモ運用のため）
+        .build();
+      validations.push([rule]);
     }
-
-    const rule = SpreadsheetApp.newDataValidation()
-      .requireValueInList(productNames, true)
-      .setAllowInvalid(true) // 手入力も許可（未登録作品メモ運用のため）
-      .build();
-    productCell.setDataValidation(rule);
+    updatedCount++;
   }
+
+  // C列（作品名）へ一括書き込み
+  sheet.getRange(2, 3, numRows, 1).setDataValidations(validations);
+
+  ui.alert('完了！\n在庫変動ログの' + updatedCount + '行分、作品名のプルダウンを更新しました。');
 }
 
 
@@ -853,43 +1125,111 @@ function updateProductCodeSheetCore(finalSheet) {
     existingRowMap.set(key, i + 1); // シート上の行番号
   }
 
-  // 商品一覧_確定から作家名・作品名・税込価格を取得
+  // D列（税込価格）に入れる数式を組み立てる
+  // 商品一覧_確定のA列（作家名）・B列（作品名）を「作家名|作品名」で連結したキーで突き合わせ、
+  // G列（税込価格）を取得する。商品一覧_確定が更新されるたびに自動で反映される
+  // （スクリプトの再実行やボタン操作が不要になる）。
+  // ※スクリプト側で行っているnormalizeTokenのようなゆるいマッチングは数式では再現できず、
+  //   完全一致での突き合わせになる点に注意（表記ゆれがあると空欄になる）
+  // ※XLOOKUPで範囲同士を&連結する場合、ARRAYFORMULAで明示的に包まないと
+  //   配列として計算されず#N/Aになる（列全体参照(A:A)だと稀に計算が噛み合わないこともあるため、
+  //   実際にデータがある行数までに絞った範囲を使う）
+  const finalLastRow = Math.max(2, finalSheet.getLastRow());
+  function buildTaxPriceFormula(rowNum) {
+    return '=IFERROR(ARRAYFORMULA(XLOOKUP($A' + rowNum + '&"|"&$C' + rowNum + ', ' +
+      PRODUCT_SHEET_FINAL + '!$A$2:$A$' + finalLastRow + '&"|"&' + PRODUCT_SHEET_FINAL + '!$B$2:$B$' + finalLastRow + ', ' +
+      PRODUCT_SHEET_FINAL + '!$G$2:$G$' + finalLastRow + ')), "")';
+  }
+
+  // 商品一覧_確定から作家名・作品名を取得（税込価格は数式に任せるのでここでは読まない）
   const finalData = finalSheet.getDataRange().getValues();
   const newRows = [];
   const seenInThisRun = new Set(); // 同一実行内での重複追加防止
   let updatedCount = 0;
+
+  // 既存行のB列（ラベル表示作家名）・D列（税込価格）は、1行ずつgetRange().setValue()すると
+  // 行数分だけサーバー通信が発生して重くなるため、まずexistingData（読み込み済み）をもとに
+  // 列全体を配列として組み立て、最後に1回でまとめて書き込む方式にしている。
+  const totalExistingRows = existingData.length - 1; // ヘッダーを除いた行数
+  const bColumnValues = []; // B列：ラベル表示作家名
+  const dColumnValues = []; // D列：税込価格（数式）
+  for (let i = 1; i < existingData.length; i++) {
+    bColumnValues.push([existingData[i][1]]); // 現状維持がデフォルト（対象外の行はそのまま）
+    dColumnValues.push([existingData[i][3]]); // 同上
+  }
 
   for (let i = 1; i < finalData.length; i++) {
     const artist = String(finalData[i][0] || '').trim();
     const product = String(finalData[i][1] || '').trim();
     if (!artist || !product) continue;
 
-    const taxPrice = finalData[i][6]; // 税込価格（10%）列
     const key = normalizeToken(artist) + '|' + normalizeToken(product);
     const labelArtist = labelMap.has(normalizeToken(artist)) ? labelMap.get(normalizeToken(artist)) : '';
 
     if (existingRowMap.has(key)) {
-      // 既存行：税込価格・ラベル表示作家名だけ上書き（作家マスタの最新値に追従させる）
+      // 既存行：D列（税込価格）を数式に、ラベル表示作家名だけ上書き（作家マスタの最新値に追従させる）
       const rowNum = existingRowMap.get(key);
-      codeSheet.getRange(rowNum, 4).setValue(taxPrice);    // D列：税込価格
-      codeSheet.getRange(rowNum, 2).setValue(labelArtist); // B列：ラベル表示作家名
+      const arrIdx = rowNum - 2; // シート上の行番号→配列インデックス（2行目が配列の0番目）
+      bColumnValues[arrIdx] = [labelArtist];
+      dColumnValues[arrIdx] = [buildTaxPriceFormula(rowNum)];
       updatedCount++;
       continue;
     }
     if (seenInThisRun.has(key)) continue;
 
     seenInThisRun.add(key);
-    // [作家名, ラベル表示作家名, 作品名, 税込価格, ラベル表示商品名, 商品コード, 在庫残数]
+    // [作家名, ラベル表示作家名, 作品名, 税込価格(後で数式を入れる), ラベル表示商品名, 商品コード, 在庫残数]
     // ラベル表示商品名・商品コード・在庫残数は空欄で追加、後で手入力
-    newRows.push([artist, labelArtist, product, taxPrice, '', '', '']);
+    newRows.push([artist, labelArtist, product, '', '', '', '']);
+  }
+
+  // B列・D列（既存分）を1回でまとめて書き込む
+  if (totalExistingRows > 0) {
+    codeSheet.getRange(2, 2, totalExistingRows, 1).setValues(bColumnValues);
+    codeSheet.getRange(2, 4, totalExistingRows, 1).setValues(dColumnValues);
   }
 
   if (newRows.length > 0) {
     const startRow = codeSheet.getLastRow() + 1;
     codeSheet.getRange(startRow, 1, newRows.length, 7).setValues(newRows);
+    // 新規追加した行のD列（税込価格）にも、1回でまとめて数式を設定する
+    const newDColumnValues = [];
+    for (let r = 0; r < newRows.length; r++) {
+      newDColumnValues.push([buildTaxPriceFormula(startRow + r)]);
+    }
+    codeSheet.getRange(startRow, 4, newRows.length, 1).setValues(newDColumnValues);
   }
 
-  return newRows.length;
+  // ---- A列（作家名）が作家マスタに存在するかチェックし、無ければ赤く色付け ----
+  // labelMapのキーは既に「正規化した作家マスタの作家名」の集合なので、そのまま流用できる。
+  // 1行ずつgetRange().setBackground()すると重くなるため、A列の背景色をまとめて読み込み、
+  // 対象行だけ差し替えてから1回でまとめて書き戻す（他の一括処理と同じ方式）。
+  // ※B列（ラベル表示作家名の上書き）とは別列なので、互いの色付けが競合しない。
+  const finalLastCodeRow = codeSheet.getLastRow();
+  const missingArtistsInCode = [];
+  if (finalLastCodeRow >= 2) {
+    const totalRows = finalLastCodeRow - 1;
+    const artistCol = codeSheet.getRange(2, 1, totalRows, 1);
+    const artistValues = artistCol.getValues();
+    const artistColors = artistCol.getBackgrounds();
+
+    for (let i = 0; i < totalRows; i++) {
+      const artist = String(artistValues[i][0] || '').trim();
+      if (!artist) continue;
+      if (!labelMap.has(normalizeToken(artist))) {
+        missingArtistsInCode.push(artist + '（' + (i + 2) + '行目）');
+        artistColors[i][0] = '#f4cccc'; // 薄い赤
+      } else if (artistColors[i][0] === '#f4cccc') {
+        // 以前は未登録だったが今は解消された行は、色を元に戻す
+        artistColors[i][0] = '#ffffff';
+      }
+    }
+    artistCol.setBackgrounds(artistColors);
+  }
+
+  const duplicateList = detectAndHighlightProductCodeDuplicates(codeSheet);
+
+  return { newRowCount: newRows.length, missingArtistsInCode: missingArtistsInCode, duplicateList: duplicateList };
 }
 
 
@@ -951,6 +1291,7 @@ function updateInventorySheet() {
   //   「②-1 商品一覧_確定のみ更新」だけを実行した場合に価格が古いまま残ってしまうリスクがあった。
   //   商品一覧_確定を唯一の価格ソースにすることで、更新のたびに二重に手間をかける必要をなくしている。
   const codeMap = new Map(); // key -> {code, stock}
+  const codeAllRows = []; // {key, artist, product, rowNum}（商品コード管理の全行。後で「在庫管理に存在しない行」の検出に使う）
   if (codeSheet) {
     const codeData = codeSheet.getDataRange().getValues();
     for (let i = 1; i < codeData.length; i++) {
@@ -962,6 +1303,7 @@ function updateInventorySheet() {
         code: codeData[i][5],
         stock: codeData[i][6],
       });
+      codeAllRows.push({ key: key, artist: artist, product: product, rowNum: i + 1 });
     }
   }
 
@@ -1006,7 +1348,7 @@ function updateInventorySheet() {
         artist: '', product: '',
         received: 0, sample: 0, reserved: 0, reservedRelease: 0,
         damaged: 0, returned: 0, acquired: 0, lost: 0,
-        carriedIn: 0, transferredOut: 0,
+        carriedIn: 0, transferredOut: 0, sampleReturned: 0,
         hasMemo: false,
       });
     }
@@ -1016,7 +1358,7 @@ function updateInventorySheet() {
   // 在庫変動ログの「種別」で認識される値の一覧
   // ※ここに無い文字列は switch 文のどのcaseにも一致せず、静かに集計から漏れる
   //   （実際に「買取在庫」と「買取済在庫」の表記違いでこの問題が起きたことがある）
-  const VALID_LOG_TYPES = ['納品', 'サンプル', '取り置き', '取り置き解消', '破損', '返却', '買取済在庫', '紛失', '繰越入庫', '振替出庫'];
+  const VALID_LOG_TYPES = ['納品', 'サンプル', '取り置き', '取り置き解消', '破損', '返却', '買取済在庫', '紛失', '繰越入庫', '振替出庫', 'サンプル返却'];
   const unrecognizedTypeRows = []; // 種別が空欄、または一覧にない値になっている行
 
   if (logSheet) {
@@ -1054,8 +1396,9 @@ function updateInventorySheet() {
         case '返却':       entry.returned += qty; break;
         case '買取済在庫':  entry.acquired += qty; break; // 現在庫には含めるが、売上集計には含めない（ロイヤリティレポート側で対応）
         case '紛失':       entry.lost += qty; break; // 紛失分は在庫数から減算する
-        case '繰越入庫':    entry.carriedIn += qty; break; // 他会期から入ってきた分。在庫数（理論値）には加算するが、納品済み(サンプル込)には含めない
-        case '振替出庫':  entry.transferredOut += qty; break; // 他会期へ出ていった分。在庫数（理論値）から減算するが、納品済み(サンプル込)には含めない
+        case '繰越入庫':    entry.carriedIn += qty; break; // 他会期から入ってきた分。在庫数（販売可サンプル含）には加算するが、納品済み(サンプル込)には含めない
+        case '振替出庫':  entry.transferredOut += qty; break; // 他会期へ出ていった分。在庫数（販売可サンプル含）から減算するが、納品済み(サンプル込)には含めない
+        case 'サンプル返却': entry.sampleReturned += qty; break; // 作家へサンプルを返却した分。在庫数（販売可サンプル含）から減算する
       }
 
       // この行が基本行（商品一覧_確定）にない場合は新規追加対象にする
@@ -1073,9 +1416,74 @@ function updateInventorySheet() {
     }
   }
 
+  // ---- 商品コード管理にはあるが、商品一覧_確定にもログにも存在しない行を拾い上げる ----
+  // 【想定シナリオ】スタッフが商品コード管理に手書きで新しい商品を追加してしまった場合など。
+  // このまま放置すると、その商品は在庫管理シートに一切出てこないため気づかれにくい。
+  // 該当行は在庫管理側にも反映しつつ、商品コード管理のC列（作品名）に色を付けて目印にする。
+  //
+  // ここまでの時点（baseMapは商品一覧_確定＋在庫変動ログの内容のみ）で、
+  // 「正規化した作家名だけ」の集合を作っておく。作家名だけなら一致する記録がある場合、
+  // 「作品名の表記が微妙に違うだけ（表記ゆれ）」の可能性が高いと判定できる。
+  // 逆に作家名すら一致しない場合は、本当に真新しい追加である可能性が高い。
+  const knownArtistNames = new Set();
+  baseMap.forEach(function(v) { knownArtistNames.add(normalizeToken(v.artist)); });
+
+  const codeOnlyRowNums = []; // 色付け対象の行番号（商品コード管理シート上）
+  const codeOnlyList = []; // 警告メッセージ用
+  codeAllRows.forEach(function(row) {
+    if (baseMap.has(row.key)) return; // 商品一覧_確定またはログに既に存在する
+    baseMap.set(row.key, {
+      artist: row.artist,
+      product: row.product,
+      sampleQtyPlanned: '',
+      deliveryQtyPlanned: '',
+      sampleOk: '',
+      taxPrice: '', // 商品一覧_確定に無いため価格不明
+    });
+    baseOrder.push(row.key);
+    codeOnlyRowNums.push(row.rowNum);
+
+    const artistKnown = knownArtistNames.has(normalizeToken(row.artist));
+    const reasonHint = artistKnown
+      ? '→作家名は一致する記録あり。作品名の表記ゆれの可能性が高い'
+      : '→作家名も一致する記録なし。手書きで新規追加された可能性が高い';
+    codeOnlyList.push(row.artist + '／' + row.product + '（商品コード管理' + row.rowNum + '行目）' + reasonHint);
+  });
+
+  // 商品コード管理のC列（作品名）に色を付ける。既存の色付け（A列の作家マスタ照合）とは
+  // 別の列なので互いに競合しない。1行ずつではなく一括で読み書きする。
+  if (codeSheet) {
+    const codeLastRow = codeSheet.getLastRow();
+    if (codeLastRow >= 2) {
+      const totalCodeRows = codeLastRow - 1;
+      const productCol = codeSheet.getRange(2, 3, totalCodeRows, 1);
+      const productColors = productCol.getBackgrounds();
+      const codeOnlySet = new Set(codeOnlyRowNums);
+
+      for (let i = 0; i < totalCodeRows; i++) {
+        const rowNum = i + 2;
+        if (codeOnlySet.has(rowNum)) {
+          productColors[i][0] = '#fff2cc'; // 薄い黄色（「まだ商品一覧_確定に無い」目印）
+        } else if (productColors[i][0] === '#fff2cc') {
+          // 以前は該当していたが、今は商品一覧_確定に反映されて解消された行は色を戻す
+          productColors[i][0] = '#ffffff';
+        }
+      }
+      productCol.setBackgrounds(productColors);
+    }
+  }
+
+  // ---- 商品コード管理内で「作家名＋作品名」の組み合わせが重複している行を検知する ----
+  // 【想定シナリオ】手書きで商品コード管理に行を追加した際、既に同じ商品の行が
+  // あることに気づかず、もう1行作ってしまい、同じ商品に2つの商品コードが
+  // 振られてしまうケース。この場合キー自体は正規シートと一致するため、
+  // 上の「codeOnly」チェック（商品一覧_確定・ログとの不一致）では検知できない。
+  // ②-1/②-2実行時にも同じチェックが走るよう、共通関数化してある。
+  const duplicateList = detectAndHighlightProductCodeDuplicates(codeSheet);
+
   // ---- 出力用の行を組み立て ----
   const headers = ['作家名', '作品名', '商品コード', '税込価格', 'サンプル数', '納品予定数',
-                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', '在庫数（理論値）', '推定販売数', '残在庫(実数)'];
+                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', '返却済サンプル', '在庫数（販売可サンプル含）', '推定販売数', '残在庫(実数)'];
   const rows = [];
 
   baseOrder.forEach(function(key) {
@@ -1083,7 +1491,7 @@ function updateInventorySheet() {
     const log = logMap.get(key) || {
       received: 0, sample: 0, reserved: 0, reservedRelease: 0,
       damaged: 0, returned: 0, acquired: 0, lost: 0,
-      carriedIn: 0, transferredOut: 0,
+      carriedIn: 0, transferredOut: 0, sampleReturned: 0,
     };
     const codeInfo = codeMap.get(key) || { code: '', stock: '' };
 
@@ -1101,18 +1509,16 @@ function updateInventorySheet() {
     // サンプル販売不可分は在庫数から除外する
     const sampleExcluded = (base.sampleOk === '不可能') ? log.sample : 0;
 
-    // 在庫数＝納品済み＋買取済在庫＋繰越入庫－振替出庫－破損－返却－取り置き中－紛失－サンプル販売不可分
+    // 在庫数（販売可サンプル含）＝納品済み＋買取済在庫＋繰越入庫－振替出庫－破損－返却－取り置き中－紛失
+    //   －返却済サンプル－サンプル販売不可分
     // （販売は引かない＝会期末の実数カウントと比較するための理論値。繰越入庫・振替出庫・買取済在庫は
     //   「今回作家から新しく届いた点数」ではないため、納品済み(サンプル込)には含めない）
     const theoreticalStock = delivered + log.acquired + log.carriedIn - log.transferredOut
-      - log.damaged - log.returned - reservedNet - log.lost - sampleExcluded;
+      - log.damaged - log.returned - reservedNet - log.lost - log.sampleReturned - sampleExcluded;
 
     // 現在庫＝商品コード管理「在庫残数」の手入力値をそのまま反映（読み取り専用のミラー）
     const manualStock = codeInfo.stock;
     const hasManualStock = manualStock !== '' && manualStock !== null && manualStock !== undefined;
-
-    // 販売数＝在庫数－現在庫（手入力がまだなければ空欄のまま＝未集計とわかるようにする）
-    const estimatedSold = hasManualStock ? (theoreticalStock - Number(manualStock)) : '';
 
     rows.push([
       base.artist,
@@ -1126,19 +1532,38 @@ function updateInventorySheet() {
       log.lost === 0 ? '' : log.lost,
       log.damaged === 0 ? '' : log.damaged,
       log.returned === 0 ? '' : log.returned,
+      log.sampleReturned === 0 ? '' : log.sampleReturned,
       theoreticalStock === 0 ? '' : theoreticalStock,
-      estimatedSold,
+      '', // 推定販売数：後段で「在庫数（販売可サンプル含）－残在庫(実数)」の数式を差し込む（同じ行の隣接セル参照）
       hasManualStock ? manualStock : '',
     ]);
+  });
+
+  // 作家名（0列目）で昇順ソート。買取済在庫・繰越入庫のみで商品一覧_確定に
+  // 存在しない商品は末尾に追加されるため、明示的にソートしないと同じ作家の行が
+  // 分断され、太線が正しく引けなくなることがある。
+  rows.sort(function(a, b) {
+    return String(a[0]).localeCompare(String(b[0]), 'ja');
+  });
+
+  // 推定販売数（列N＝13番目、0始まりで13）に「在庫数（販売可サンプル含）－残在庫(実数)」の数式を差し込む。
+  // 列M＝在庫数（販売可サンプル含）、列O＝残在庫(実数)は同じ行の隣接セルなので、行番号さえ分かれば
+  // シンプルな同一シート内参照で済む（ソート後の最終的な行位置を使って組み立てる）。
+  // 残在庫(実数)が空欄（会期末カウント未実施）の間は空欄のまま、という以前の挙動を
+  // IF文で再現している。値ではなく数式にしたことで、残在庫(実数)が更新されると
+  // スクリプトを再実行しなくても自動で再計算されるようになる。
+  rows.forEach(function(row, idx) {
+    const sheetRow = idx + 2; // ヘッダーが1行目なので、データはidx+2行目に書き込まれる
+    row[13] = '=IF(O' + sheetRow + '="","",M' + sheetRow + '-O' + sheetRow + ')';
   });
 
   // ---- シートに書き込み ----
   const sheet = buildProductSheet(INVENTORY_SHEET, rows, headers);
   addArtistBorders(sheet, rows, headers);
 
-  // 「破損」「返却」列は普段見る必要が薄いため、デフォルトで折りたたんでおく（列番号10・11＝J・K列）
-  // 見たいときは列見出しの「+」をクリックすれば展開できる
-  sheet.hideColumns(10, 2);
+  // 「破損」「返却」「返却済サンプル」列は普段見る必要が薄いため、デフォルトで折りたたんでおく
+  // （列番号10〜12＝J・K・L列）。見たいときは列見出しの「+」をクリックすれば展開できる
+  sheet.hideColumns(10, 3);
 
   let message = '完了！\n' + rows.length + '件の在庫データを更新しました。\n' +
     '※「残在庫(実数)」は商品コード管理の「在庫残数」を反映したものです。会期末のカウント結果はそちらに入力してください。';
@@ -1147,6 +1572,21 @@ function updateInventorySheet() {
     message += '\n\n⚠️ 在庫変動ログに種別が空欄・または認識されない行が' + unrecognizedTypeRows.length + '件あります（この行は集計に反映されていません）：\n' +
       unrecognizedTypeRows.slice(0, 15).join('\n') +
       (unrecognizedTypeRows.length > 15 ? '\n…他' + (unrecognizedTypeRows.length - 15) + '件' : '');
+  }
+
+  if (codeOnlyList.length > 0) {
+    message += '\n\n⚠️ 商品コード管理にあるのに、商品一覧_確定にも在庫変動ログにも一致する記載が見つからない商品が' + codeOnlyList.length + '件あります（商品コード管理のC列を黄色くしています。この在庫管理シートには反映済みです）：\n' +
+      codeOnlyList.slice(0, 15).join('\n') +
+      (codeOnlyList.length > 15 ? '\n…他' + (codeOnlyList.length - 15) + '件' : '') +
+      '\n\n「作品名の表記ゆれの可能性が高い」の場合→在庫変動ログ・商品一覧_確定と商品コード管理で、該当作家の作品名の表記を見比べて揃えてください\n' +
+      '「手書きで新規追加された可能性が高い」の場合→在庫変動ログに「買取済在庫」等で記録がなければ追加してください（記録済みなら作家名の表記ゆれを疑ってください）';
+  }
+
+  if (duplicateList.length > 0) {
+    message += '\n\n⚠️ 商品コード管理内で同じ商品（作家名＋作品名）に複数の行・複数の商品コードが振られています（商品コード管理のF列を薄いオレンジにしています）：\n' +
+      duplicateList.slice(0, 15).join('\n') +
+      (duplicateList.length > 15 ? '\n…他' + (duplicateList.length - 15) + '件' : '') +
+      '\n\nどちらか一方の行を削除・統合してください。放置すると在庫数が二重にカウントされる可能性があります。';
   }
 
   SpreadsheetApp.getUi().alert(message);
@@ -1210,7 +1650,7 @@ function updateInventorySheetBySku() {
   const squareMap = getSquareSalesMap();
 
   const headers = ['作家名', '作品名', '商品コード', '税込価格', 'サンプル数', '納品予定数',
-                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', '在庫数（理論値）', '残在庫(実数)', '推定販売数', 'Square販売数'];
+                    '納品済み(サンプル込)', '取置き中', '紛失', '破損', '返却', '返却済サンプル', '在庫数（販売可サンプル含）', '残在庫(実数)', '推定販売数', 'Square販売数'];
 
   function toNum(v) {
     const n = Number(v);
@@ -1221,7 +1661,8 @@ function updateInventorySheetBySku() {
   }
 
   // 在庫管理(商品ごと)の列：0作家名 1作品名 2商品コード 3税込価格 4サンプル数 5納品予定数
-  // 6納品済み(サンプル込) 7取置き中 8紛失 9破損 10返却 11在庫数（理論値） 12推定販売数 13残在庫(実数)
+  // 6納品済み(サンプル込) 7取置き中 8紛失 9破損 10返却 11返却済サンプル
+  // 12在庫数（販売可サンプル含） 13推定販売数 14残在庫(実数)
   const groupMap = new Map(); // 商品コード -> 集計用オブジェクト
   const groupOrder = [];
   const passthroughRows = []; // 商品コードが空の行はそのまま出力（末尾に追加）
@@ -1236,8 +1677,8 @@ function updateInventorySheetBySku() {
     if (!code) {
       passthroughRows.push([
         artist, product, row[2], row[3],
-        row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], row[13],
-        row[12], // 推定販売数（商品ごとシートの値そのまま）
+        row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], row[12], row[14],
+        row[13], // 推定販売数（商品ごとシートの値そのまま、数式の計算結果が入っている）
         squareNet,
       ]);
       continue;
@@ -1246,7 +1687,7 @@ function updateInventorySheetBySku() {
     if (!groupMap.has(code)) {
       groupMap.set(code, {
         artist: artist, product: product, taxPrice: row[3],
-        sample: 0, deliveryPlanned: 0, delivered: 0, reserved: 0, lost: 0, damaged: 0, returned: 0,
+        sample: 0, deliveryPlanned: 0, delivered: 0, reserved: 0, lost: 0, damaged: 0, returned: 0, sampleReturned: 0,
         stock: 0, currentStock: 0, hasCurrentStock: false,
         estimatedSold: 0, hasEstimatedSold: false,
         squareSold: 0, hasSquareSold: false,
@@ -1262,56 +1703,75 @@ function updateInventorySheetBySku() {
     g.lost += toNum(row[8]);
     g.damaged += toNum(row[9]);
     g.returned += toNum(row[10]);
-    g.stock += toNum(row[11]);
-    if (hasValue(row[13])) { g.currentStock += toNum(row[13]); g.hasCurrentStock = true; }
-    if (hasValue(row[12]))  { g.estimatedSold += toNum(row[12]); g.hasEstimatedSold = true; }
+    g.sampleReturned += toNum(row[11]);
+    g.stock += toNum(row[12]);
+    if (hasValue(row[14])) { g.currentStock += toNum(row[14]); g.hasCurrentStock = true; }
+    if (hasValue(row[13]))  { g.estimatedSold += toNum(row[13]); g.hasEstimatedSold = true; } // 推定販売数（数式の計算結果）
     if (squareNet !== '')  { g.squareSold += toNum(squareNet); g.hasSquareSold = true; }
   }
 
-  const rows = [];
-  const mismatchRowIndexes = []; // rows配列上のインデックス（0始まり）
+  // rowEntries：各行データと「不一致フラグ」をセットで持つ。ソート後もフラグが
+  // 正しい行についてくるよう、rowsとmismatchRowIndexesを別々に作らずここでまとめる。
+  const rowEntries = [];
 
   groupOrder.forEach(function(code) {
     const g = groupMap.get(code);
     const estimatedSoldVal = g.hasEstimatedSold ? g.estimatedSold : '';
     const squareSoldVal = g.hasSquareSold ? g.squareSold : '';
 
-    rows.push([
+    const row = [
       g.artist, g.product, code, g.taxPrice,
       g.sample, g.deliveryPlanned, g.delivered, g.reserved === 0 ? '' : g.reserved,
       g.lost === 0 ? '' : g.lost,
       g.damaged === 0 ? '' : g.damaged,
       g.returned === 0 ? '' : g.returned,
+      g.sampleReturned === 0 ? '' : g.sampleReturned,
       g.stock === 0 ? '' : g.stock,
       g.hasCurrentStock ? g.currentStock : '',
       estimatedSoldVal,
       squareSoldVal,
-    ]);
-
-    if (g.hasEstimatedSold && g.hasSquareSold && g.estimatedSold !== g.squareSold) {
-      mismatchRowIndexes.push(rows.length - 1);
-    }
+    ];
+    const mismatch = g.hasEstimatedSold && g.hasSquareSold && g.estimatedSold !== g.squareSold;
+    rowEntries.push({ row: row, mismatch: mismatch });
   });
 
   passthroughRows.forEach(function(r) {
-    rows.push(r);
-    const est = r[13], sq = r[14];
-    if (est !== '' && sq !== '' && Number(est) !== Number(sq)) {
-      mismatchRowIndexes.push(rows.length - 1);
-    }
+    const est = r[14], sq = r[15];
+    const mismatch = est !== '' && sq !== '' && Number(est) !== Number(sq);
+    rowEntries.push({ row: r, mismatch: mismatch });
+  });
+
+  // 作家名（0列目）で昇順ソート。同じ作家の商品が分断されると太線が正しく引けなくなるため。
+  // Array.sortは安定ソートなので、同じ作家内の並び順（グループ化された順）は保たれる。
+  rowEntries.sort(function(a, b) {
+    return String(a.row[0]).localeCompare(String(b.row[0]), 'ja');
+  });
+
+  const rows = rowEntries.map(function(entry) { return entry.row; });
+  const mismatchRowIndexes = []; // rows配列上のインデックス（0始まり）
+  rowEntries.forEach(function(entry, idx) {
+    if (entry.mismatch) mismatchRowIndexes.push(idx);
   });
 
   const sheet = buildProductSheet(INVENTORY_SHEET_BY_SKU, rows, headers);
   addArtistBorders(sheet, rows, headers);
 
-  // 「破損」「返却」列は普段見る必要が薄いため、デフォルトで折りたたんでおく（列番号10・11＝J・K列）
-  sheet.hideColumns(10, 2);
+  // 「破損」「返却」「返却済サンプル」列は普段見る必要が薄いため、デフォルトで折りたたんでおく
+  // （列番号10〜12＝J・K・L列）
+  sheet.hideColumns(10, 3);
 
-  // 推定販売数(14列目)とSquare販売数(15列目)が不一致の行は背景色を変える
-  mismatchRowIndexes.forEach(function(idx) {
-    sheet.getRange(idx + 2, 14).setBackground('#f4cccc');
-    sheet.getRange(idx + 2, 15).setBackground('#f4cccc');
-  });
+  // 推定販売数(15列目)とSquare販売数(16列目)が不一致の行は背景色を変える
+  // 1行ずつsetBackground()すると不一致件数分サーバー通信が発生するため、
+  // 該当2列分の背景色をまとめて読み込み、不一致行だけ差し替えてから1回で書き戻す。
+  if (rows.length > 0) {
+    const mismatchCols = sheet.getRange(2, 15, rows.length, 2);
+    const mismatchColors = mismatchCols.getBackgrounds();
+    mismatchRowIndexes.forEach(function(idx) {
+      mismatchColors[idx][0] = '#f4cccc';
+      mismatchColors[idx][1] = '#f4cccc';
+    });
+    mismatchCols.setBackgrounds(mismatchColors);
+  }
 
   SpreadsheetApp.getUi().alert(
     '完了！\n' + rows.length + '件のSKU別在庫データを更新しました。\n' +
